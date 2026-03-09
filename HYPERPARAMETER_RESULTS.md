@@ -11,6 +11,23 @@
 | EMBEDDING_LR | 1.0 | 1.75 | -1.4% |
 | FINAL_LR_FRAC | 0.0 | 0.05 | -1.2% |
 
+## Novel Systems Findings (March 2026)
+
+### MLX vs PyTorch MPS Backend
+| Backend | tok/sec | Speedup |
+|---------|---------|---------|
+| PyTorch MPS | 37,891 | 1.0x |
+| Apple MLX | 94,933 | **2.5x** |
+
+**Finding**: MLX is 2.5x faster than PyTorch MPS for the same model!
+
+### Rejected Experiments
+
+| Parameter | Tested | val_bpb | Status |
+|-----------|--------|---------|--------|
+| WARMUP_RATIO | 0.1 | 1.705 | ❌ 15% worse |
+| DEPTH | 6 | - | ❌ Too slow (26M params, 5min/step) |
+
 ## Detailed Results
 
 ### WINDOW_PATTERN (Sliding Window Attention)
