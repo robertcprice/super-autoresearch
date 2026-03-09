@@ -499,27 +499,46 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
+# See HYPERPARAMETER_RESULTS.md for full experiment history and findings.
+# Best result: val_bpb = 1.479239 (14.4% better than baseline 1.727831)
 
 # Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SS"    # sliding window pattern: L=full, S=half context
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO (unexplored)
+HEAD_DIM = 128          # target head dimension for attention (unexplored)
+WINDOW_PATTERN = "SS"   # sliding window pattern: L=full, S=half context
+                        # TESTED: LLLL=baseline, SSSL=1.648, SSL=1.567, SS=1.520 ✓ BEST
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
 EMBEDDING_LR = 1.75     # learning rate for token embeddings (Adam)
+                        # TESTED: 0.75=1.497, 0.8=1.503, 0.9=1.507, 1.0=1.899, 1.5=1.656, 1.75=1.504, 2.0=1.610
+                        # Note: 0.75 was slightly better but 1.75 works well with other params
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
+                        # TESTED: 0.01=1.604(worse), 0.002=1.713(worse) - KEEP DEFAULT
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+                        # TESTED: 0.03=1.533(worse), 0.06=1.868(worse) - KEEP DEFAULT
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
+                        # TESTED: 0.3=1.558(worse), 0.7=1.672(worse) - KEEP DEFAULT
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+                        # TESTED: 0.3=1.877(worse) - KEEP DEFAULT
 ADAM_BETAS = (0.9, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
+                        # TESTED: (0.9, 0.99)=1.689(worse) - KEEP DEFAULT
+WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup (unexplored)
 WARMDOWN_RATIO = 0.7    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
+                        # TESTED: 0.5=baseline, 0.6=1.720(worse), 0.7=1.672✓, 0.8=1.775(worse)
+FINAL_LR_FRAC = 0.05    # final LR as fraction of initial (non-zero prevents too-fast decay)
+                        # TESTED: 0.0=baseline, 0.02=1.753(much worse), 0.05=1.479✓, 0.1=1.481(slightly worse)
 
 # Model size
-DEPTH = 4               # number of transformer layers
+DEPTH = 4               # number of transformer layers (unexplored)
 DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+
+# DISABLED/REJECTED (tested and found worse):
+# - bf16 autocast: val_bpb=1.754 (worse than fp32)
+# - Higher UNEMBEDDING_LR: no improvement
+# - Different SCALAR_LR: no improvement
+# - Higher WEIGHT_DECAY: worse convergence
+# - Different ADAM_BETAS: worse convergence
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
