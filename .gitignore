@@ -8,13 +8,57 @@ wheels/
 
 # Virtual environments
 .venv
-worktrees/
-results/
-queue/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
 AGENTS.md
 
-# Experimental code/artifacts
+# Run artifacts (local experiment data)
+benchmark_runs/
+warm_start_runs/
+scheduler_runs/
+backend_runs/
+worktrees/
+results/
+queue/
+experiment_memory.jsonl
+
+# Experimental prototypes (not part of the default path)
 dev/
+mlx_gpt.py
+train_optimized.py
+cross_backend_probe.py
+mpsc_adaptive_compute.py
+mpsc_benchmark.py
+mpsc_curriculum.py
+mpsc_dataloader.py
+mpsc_distillation.py
+mpsc_distributed.py
+mpsc_hyperparams.py
+mpsc_long_context.py
+mpsc_mamba.py
+mpsc_mask_cache.py
+mpsc_memory.py
+mpsc_metal_kernels.py
+mpsc_model_registry.py
+mpsc_moe.py
+mpsc_multimodal.py
+mpsc_nas.py
+mpsc_neural_engine.py
+mpsc_quantization.py
+mpsc_rat.py
+mpsc_rest_api.py
+mpsc_rlhf.py
+mpsc_selfplay.py
+mpsc_streaming.py
+mpsc_tracking.py
+mpsc_web_ui.py
+
+# Internal docs (not for public README)
+CHANGES.md
+EVALUATION.md
+FEATURES.md
+MPS_README.md
+NOVEL_IMPLEMENTATIONS.md
+OPTIMIZATIONS.md
+TODO.md

@@ -1,68 +1,116 @@
-# autoresearch-macos
+# super-autoresearch
 
-![teaser](progress.png)
+PyTorch + MPS research platform built on [karpathy/autoresearch](https://github.com/karpathy/autoresearch) for Apple Silicon. Based on [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos).
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
-
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
-
-## How it works
-
-The repo is deliberately kept small and only really has a three files that matter:
-
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
-
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+Point Claude Code at `program.md`, go to sleep, wake up to results.
 
 ## Quick start
 
-**Requirements:** Apple Silicon Mac (M1/M2/M3/M4 with Metal/MPS support) or a single NVIDIA GPU, Python 3.10+, [uv](https://docs.astral.sh/uv/).
+Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
-
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
 uv sync
-
-# 3. Download data and train tokenizer (one-time, ~2 min)
 uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
 uv run train.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+Then point your agent at `program.md` and let it run overnight.
 
-**Platforms support**. This fork officially supports **macOS (Apple Silicon / MPS)** and CPU environments, while preserving the original NVIDIA GPU support. It removes the hardcoded dependency on FlashAttention-3, falling back to PyTorch's native Scaled Dot Product Attention (SDPA) with manual sliding window causal masking when needed. It also features MPS-specific optimizations (disabling unsupported `torch.compile` paths, lowering memory batch sizes for Metal bounds, and precisely casting optimizer states) allowing you to run autonomous research agents directly on your Mac!
+## Results on M4 Pro (24GB)
 
-## Running the agent
+| Run | Config | val_bpb | tok/s | Notes |
+|---|---|---|---|---|
+| default | baseline | 1.538 | 24,281 | 5-min budget, default depth |
+| origin/master | upstream port | 1.542 | 29,607 | miolini baseline |
+| warm-start | 20s sample + 100s promoted | **1.980** | 27,889 | checkpoint warm-start |
+| cold | 120s full budget | 1.982 | 6,390 | no warm-start |
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Upstream H100 reference: val_bpb **0.998** in the same 5-minute budget.
 
+### Warm-start study
+
+Built-in tooling to answer: does warm-starting from a sample checkpoint beat a cold run?
+
+| Path | val_bpb | Wall time |
+|---|---|---|
+| Warm (20s sample + 100s promoted) | **1.980** | 505s |
+| Cold (120s full budget) | 1.982 | 583s |
+
+Warm start wins on both quality (-0.002 bpb) and speed (-78s wall time).
+
+## How it works
+
+Same three-file contract as upstream:
+
+- **`prepare.py`** — data prep, tokenizer, dataloader, evaluation. Fixed.
+- **`train.py`** — model, optimizer, training loop. The agent edits this.
+- **`program.md`** — agent instructions. Point your agent here.
+
+The agent reads `program.md`, modifies `train.py`, runs a 5-minute experiment, checks `val_bpb`, and commits or reverts.
+
+## Differences from upstream
+
+- **PyTorch MPS instead of CUDA.** Runs natively on Apple Silicon unified memory.
+- **Preset system.** `AUTORESEARCH_PRESET=large` for scaled-up configs.
+- **Gradient checkpointing.** Fits larger models in unified memory.
+- **Checkpoint warm-starts.** Resume from sample checkpoints to skip early training.
+- **Eval batch auto-probing.** Finds the largest safe eval batch size via OOM-safe binary search.
+- **Thermal-aware scheduling.** Respects macOS power/thermal state before launching long runs.
+- **Benchmark harness.** Compare variants, track experiment history, reproduce results.
+
+## Research tooling
+
+Beyond the core loop, this repo includes tools for systematic experimentation:
+
+```bash
+# benchmark current vs origin/master (30s sample)
+uv run benchmark.py
+
+# full 5-minute quality comparison
+uv run benchmark.py --full-run
+
+# benchmark the large preset
+uv run benchmark.py --variant 'current@AUTORESEARCH_PRESET=large'
+
+# warm-start study: does sample + promote beat cold?
+uv run warm_start_study.py --total-training-budget 120
+
+# rank candidate presets and promote the winner
+uv run candidate_scheduler.py --sample-duration 20 --promote-top 1
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
-```
 
-The `program.md` file is essentially a super lightweight "skill".
+## Environment overrides
 
-## Project structure
+| Variable | Default | Description |
+|---|---|---|
+| `AUTORESEARCH_PRESET` | (none) | Model preset: `large`, etc. |
+| `AUTORESEARCH_TIME_BUDGET_SECONDS` | 300 | Override the 5-minute training budget |
+| `AUTORESEARCH_EVAL_BATCH_SIZE` | (training batch) | `auto` to probe, or an integer |
+| `AUTORESEARCH_INIT_FROM` | (none) | Path to checkpoint for warm-start |
+| `AUTORESEARCH_MPS_AUTOCAST` | off | Set to `bf16` to enable MPS bf16 autocast |
 
-```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
-```
+## File map
 
-## Design choices
+Core path:
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+| File | Purpose |
+|---|---|
+| `prepare.py` | Data, tokenizer, dataloader, evaluation (fixed) |
+| `train.py` | Model, optimizer, training loop (agent-editable) |
+| `program.md` | Agent instructions |
+| `mpsc_config.py` | Preset definitions |
+| `mpsc_checkpoint.py` | Gradient checkpointing wrapper |
+| `checkpoint_reuse.py` | Save/load training checkpoints |
+
+Research tooling:
+
+| File | Purpose |
+|---|---|
+| `benchmark.py` | Variant comparison harness |
+| `experiment_memory.py` | Experiment history (JSONL) |
+| `thermal_tuner.py` | macOS power/thermal heuristics |
+| `candidate_scheduler.py` | Multi-preset ranking and promotion |
+| `warm_start_study.py` | Warm-start vs cold A/B study |
 
 ## License
 

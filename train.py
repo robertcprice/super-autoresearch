@@ -8,26 +8,25 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+# MPS compilation support
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 import gc
 import time
 from dataclasses import dataclass, asdict
+from contextlib import nullcontext
 
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def verify_macos_env():
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
+from checkpoint_reuse import save_training_checkpoint, warm_start_model
+from mpsc_checkpoint import checkpoint_wrapper
+from mpsc_config import get_preset
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb, verify_macos_env
 
-verify_macos_env()
-
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+verify_macos_env(verbose=True)
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -42,6 +41,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    use_checkpointing: bool = False
 
 
 def norm(x):
@@ -299,7 +299,28 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            if self.config.use_checkpointing and self.training:
+                rotary_cos, rotary_sin = cos_sin
+                window_size = self.window_sizes[i]
+                if ve is None:
+                    x = checkpoint_wrapper(
+                        block,
+                        lambda hidden, cos, sin: block(hidden, None, (cos, sin), window_size),
+                        x,
+                        rotary_cos,
+                        rotary_sin,
+                    )
+                else:
+                    x = checkpoint_wrapper(
+                        block,
+                        lambda hidden, value_embed, cos, sin: block(hidden, value_embed, (cos, sin), window_size),
+                        x,
+                        ve,
+                        rotary_cos,
+                        rotary_sin,
+                    )
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
 
         softcap = 15
@@ -411,7 +432,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         
-        # Compile conditionally
+        # Compile conditionally - MPS torch.compile not fully stable yet (inductor assertion)
         compiler_kwargs = {"dynamic": False, "fullgraph": True}
         if device_type in ("cuda", "cpu"):
             self.adamw_step_fused = torch.compile(adamw_step_fused, **compiler_kwargs)
@@ -514,38 +535,112 @@ torch.set_float32_matmul_precision("high")
 device_type = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 device = torch.device(device_type)
 
+def torch_version_at_least(major, minor):
+    base = torch.__version__.split("+", 1)[0]
+    parts = []
+    for piece in base.split("."):
+        digits = []
+        for ch in piece:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        parts.append(int("".join(digits) or "0"))
+    while len(parts) < 2:
+        parts.append(0)
+    return tuple(parts[:2]) >= (major, minor)
+
+def use_mps_bf16():
+    override = os.environ.get("AUTORESEARCH_MPS_AUTOCAST", "").strip().lower()
+    if override in {"1", "true", "on", "bf16", "bfloat16"}:
+        return True
+    if override in {"0", "false", "off", "none", "disable"}:
+        return False
+    return torch_version_at_least(2, 10)
+
 # Autocast context
 if device_type == "cuda":
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+elif device_type == "mps":
+    autocast_ctx = (
+        torch.amp.autocast(device_type="mps", dtype=torch.bfloat16)
+        if use_mps_bf16()
+        else nullcontext()
+    )
 elif device_type == "cpu":
     autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
 else:
-    import contextlib
-    autocast_ctx = contextlib.nullcontext()
+    autocast_ctx = nullcontext()
 
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
+precision_mode = "bf16"
+if device_type == "mps":
+    precision_mode = "bf16 autocast" if use_mps_bf16() else "fp32 (set AUTORESEARCH_MPS_AUTOCAST=bf16 to opt in)"
+    print(f"MPS precision mode: {precision_mode}")
+
+init_checkpoint = os.environ.get("AUTORESEARCH_INIT_FROM", "").strip()
+save_checkpoint = os.environ.get("AUTORESEARCH_SAVE_CHECKPOINT", "").strip()
+periodic_checkpoint_path = os.environ.get("AUTORESEARCH_PERIODIC_CHECKPOINT", "").strip()
+checkpoint_every_steps = int(os.environ.get("AUTORESEARCH_CHECKPOINT_EVERY_STEPS", "10"))
+preset_name = os.environ.get("AUTORESEARCH_PRESET", "").strip()
+time_budget_seconds = float(os.environ.get("AUTORESEARCH_TIME_BUDGET_SECONDS", TIME_BUDGET))
+eval_batch_override = os.environ.get("AUTORESEARCH_EVAL_BATCH_SIZE", "").strip().lower()
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "on", "yes"}
+
+exit_after_eval_probe = env_flag("AUTORESEARCH_EXIT_AFTER_EVAL_PROBE")
+
+run_depth = DEPTH
+run_device_batch_size = DEVICE_BATCH_SIZE
+run_aspect_ratio = ASPECT_RATIO
+run_use_checkpointing = False
+if preset_name:
+    preset = get_preset(preset_name)
+    run_depth = int(preset["depth"])
+    run_device_batch_size = int(preset["batch_size"])
+    run_aspect_ratio = int(preset["aspect_ratio"])
+    run_use_checkpointing = bool(preset["use_checkpointing"])
+
+run_depth = int(os.environ.get("AUTORESEARCH_DEPTH", run_depth))
+run_device_batch_size = int(os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE", run_device_batch_size))
+run_aspect_ratio = int(os.environ.get("AUTORESEARCH_ASPECT_RATIO", run_aspect_ratio))
+run_use_checkpointing = env_flag("AUTORESEARCH_USE_CHECKPOINTING", run_use_checkpointing)
 
 def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
+    base_dim = depth * run_aspect_ratio
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        use_checkpointing=run_use_checkpointing,
     )
 
-config = build_model_config(DEPTH)
+config = build_model_config(run_depth)
 print(f"Model config: {asdict(config)}")
+if preset_name:
+    print(f"Preset: {preset_name}")
 
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+if init_checkpoint:
+    report = warm_start_model(model, init_checkpoint)
+    print(
+        "Warm start checkpoint: "
+        f"{report.loaded_tensors}/{report.total_candidate_tensors} tensors loaded "
+        f"from {report.path} ({report.skipped_tensors} skipped)"
+    )
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -555,9 +650,9 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+tokens_per_fwdbwd = run_device_batch_size * MAX_SEQ_LEN
+grad_accum_steps = max(1, round(TOTAL_BATCH_SIZE / tokens_per_fwdbwd))
+actual_total_batch_size = grad_accum_steps * tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -568,15 +663,20 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# torch.compile is unstable on MPS, only use on CUDA
+# torch.compile on MPS has issues with certain ops (mean.dim) - disable for model
+# Optimizer compilation in MuonAdamW may still work with suppress_errors=True
 if device_type == "cuda":
     model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, run_device_batch_size, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
+if time_budget_seconds != TIME_BUDGET:
+    print(f"Overridden time budget: {time_budget_seconds:.1f}s")
+print(f"Target total batch size: {TOTAL_BATCH_SIZE}")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Actual total batch size: {actual_total_batch_size}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -604,12 +704,89 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+peak_vram_mb = 0.0
 
 def sync_device(device_type):
     if device_type == "cuda":
         torch.cuda.synchronize()
     elif device_type == "mps":
         torch.mps.synchronize()
+
+def current_device_memory_mb(device_type):
+    if device_type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024 / 1024
+    if device_type == "mps" and hasattr(torch.mps, "driver_allocated_memory"):
+        return torch.mps.driver_allocated_memory() / 1024 / 1024
+    return 0.0
+
+def clear_device_cache(device_type):
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+    elif device_type == "mps" and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+def is_oom_error(exc):
+    text = str(exc).lower()
+    return "out of memory" in text or "oom" in text
+
+def resolve_eval_batch_size(default_batch_size):
+    if not eval_batch_override:
+        return default_batch_size
+
+    if eval_batch_override == "auto":
+        requested_batch_size = max(default_batch_size, DEVICE_BATCH_SIZE)
+    else:
+        requested_batch_size = max(1, int(eval_batch_override))
+
+    if requested_batch_size <= default_batch_size:
+        return requested_batch_size
+
+    candidate_batch_size = requested_batch_size
+    while candidate_batch_size >= default_batch_size:
+        try:
+            probe_loader = make_dataloader(tokenizer, candidate_batch_size, MAX_SEQ_LEN, "val")
+            x_probe, y_probe, _ = next(probe_loader)
+            with autocast_ctx:
+                probe_loss = model(x_probe, y_probe, reduction='none')
+            sync_device(device_type)
+            del probe_loader, x_probe, y_probe, probe_loss
+            clear_device_cache(device_type)
+            if candidate_batch_size != default_batch_size:
+                print(f"Eval batch probe selected batch_size={candidate_batch_size}")
+            return candidate_batch_size
+        except RuntimeError as exc:
+            if not is_oom_error(exc):
+                raise
+            halved = candidate_batch_size // 2
+            clear_device_cache(device_type)
+            gc.collect()
+            if halved < default_batch_size:
+                break
+            print(f"Eval batch probe failed at {candidate_batch_size}; retrying with {halved}")
+            candidate_batch_size = halved
+
+    print(f"Eval batch probe falling back to batch_size={default_batch_size}")
+    return default_batch_size
+
+def maybe_save_periodic_checkpoint(current_step):
+    if not periodic_checkpoint_path:
+        return
+    if checkpoint_every_steps <= 0:
+        return
+    if current_step == 0 or current_step % checkpoint_every_steps != 0:
+        return
+    save_training_checkpoint(
+        periodic_checkpoint_path,
+        model,
+        optimizer=None,
+        config=asdict(config),
+        summary={
+            "step": int(current_step),
+            "training_seconds": float(total_training_time),
+            "peak_vram_mb": float(peak_vram_mb),
+        },
+        extra={"device_type": device_type, "periodic": True},
+    )
 
 while True:
     sync_device(device_type)
@@ -623,7 +800,7 @@ while True:
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    progress = min(total_training_time / time_budget_seconds, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -645,6 +822,7 @@ while True:
     sync_device(device_type)
     t1 = time.time()
     dt = t1 - t0
+    peak_vram_mb = max(peak_vram_mb, current_device_memory_mb(device_type))
 
     if step > 10:
         total_training_time += dt
@@ -654,9 +832,9 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    tok_per_sec = int(actual_total_batch_size / dt)
+    mfu = 100 * num_flops_per_token * actual_total_batch_size / dt / H100_BF16_PEAK_FLOPS
+    remaining = max(0, time_budget_seconds - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
@@ -669,36 +847,72 @@ while True:
         gc.collect()
 
     step += 1
+    maybe_save_periodic_checkpoint(step)
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > 10 and total_training_time >= time_budget_seconds:
         break
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = step * actual_total_batch_size
 
 # Final eval
 model.eval()
+t_eval_start = time.time()
+eval_batch_size = resolve_eval_batch_size(run_device_batch_size)
+if exit_after_eval_probe:
+    print("---")
+    print(f"time_budget_seconds: {time_budget_seconds:.1f}")
+    print(f"eval_batch_size:  {eval_batch_size}")
+    print("eval_probe_only:  true")
+    raise SystemExit(0)
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, eval_batch_size)
+sync_device(device_type)
+eval_seconds = time.time() - t_eval_start
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-if device_type == "cuda":
-    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-else:
-    peak_vram_mb = 0.0
+steady_state_mfu = 100 * num_flops_per_token * actual_total_batch_size * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+peak_vram_mb = max(peak_vram_mb, current_device_memory_mb(device_type))
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
+print(f"time_budget_seconds: {time_budget_seconds:.1f}")
 print(f"training_seconds: {total_training_time:.1f}")
+print(f"eval_seconds:     {eval_seconds:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"depth:            {config.n_layer}")
+print(f"device_batch_size: {run_device_batch_size}")
+print(f"eval_batch_size:  {eval_batch_size}")
+print(f"checkpointing:    {config.use_checkpointing}")
+
+if save_checkpoint:
+    checkpoint_summary = {
+        "val_bpb": float(val_bpb),
+        "time_budget_seconds": float(time_budget_seconds),
+        "training_seconds": float(total_training_time),
+        "eval_seconds": float(eval_seconds),
+        "total_seconds": float(t_end - t_start),
+        "peak_vram_mb": float(peak_vram_mb),
+        "total_tokens_M": float(total_tokens / 1e6),
+        "num_steps": int(step),
+        "num_params_M": float(num_params / 1e6),
+        "depth": int(config.n_layer),
+    }
+    checkpoint_path = save_training_checkpoint(
+        save_checkpoint,
+        model,
+        optimizer=optimizer,
+        config=asdict(config),
+        summary=checkpoint_summary,
+        extra={"device_type": device_type, "precision_mode": precision_mode if device_type == "mps" else "bf16"},
+    )
+    print(f"checkpoint_path:  {checkpoint_path}")

@@ -23,16 +23,14 @@ import rustbpe
 import tiktoken
 import torch
 
-def verify_macos_env():
-    import sys
+def verify_macos_env(verbose=False):
     if sys.platform != "darwin":
         raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
-
-verify_macos_env()
+    if verbose:
+        print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
+        print()
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -383,6 +381,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    verify_macos_env(verbose=True)
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")

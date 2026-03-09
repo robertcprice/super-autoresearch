@@ -1,11 +1,12 @@
 [project]
-name = "autoresearch"
+name = "super-autoresearch"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "PyTorch MPS research platform for autonomous pretraining on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "matplotlib>=3.10.8",
+    "mlx>=0.31.0",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
     "pyarrow>=21.0.0",
