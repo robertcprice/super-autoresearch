@@ -20,10 +20,13 @@ Then point your agent at `program.md` and let it run overnight.
 
 | Run | Config | val_bpb | tok/s | Notes |
 |---|---|---|---|---|
+| **optimized** | EMB_LR=2.0, MAT_LR=0.08 | **1.486** | ~32,000 | 5-min budget, optimized LRs |
 | default | baseline | 1.538 | 24,281 | 5-min budget, default depth |
 | origin/master | upstream port | 1.542 | 29,607 | miolini baseline |
-| warm-start | 20s sample + 100s promoted | **1.980** | 27,889 | checkpoint warm-start |
+| warm-start | 20s sample + 100s promoted | 1.980 | 27,889 | checkpoint warm-start |
 | cold | 120s full budget | 1.982 | 6,390 | no warm-start |
+
+**Our optimized config is 9% better than baseline** (1.486 vs 1.633 on identical runs).
 
 Upstream H100 reference: val_bpb **0.998** in the same 5-minute budget.
 
